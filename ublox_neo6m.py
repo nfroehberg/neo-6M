@@ -9,6 +9,7 @@
 
 import binascii
 import serial
+import sys
 
 try:
     from ublox_neo6m_ubx import Neo6M_UBX
@@ -21,7 +22,26 @@ try:
 except:
     geo=False
 
+# using ordered dictionaries for easier reading of printout in order (no benefit for referencing in code),
+# in Python 3.6 and later, normal dictionaries are ordered
+if not (sys.version_info[0] >= 3 and sys.version_info[1] >= 6):
+    from collections import OrderedDict
 
+NMEA_key = {
+    'GPDTM': ['LLL', 'LSD','lat','NS','Lon','EW','alt','RRR','cs'],
+    'GPGBS': ['hhmmss.ss','errlat','errlon','erralt','svid','prob','bias','stddev','cs'],
+    'GPGGA': ['hhmmss.ss','Latitude','N','Longitude','E','FS','NoSV','HDOP','msl','uMsl',
+            'Altref','uSep','DiffAge','DiffStation','cs'],
+    'GPGST': ['hhmmss.ss','range_rms','std_major','std_minor','hdg','std_lat','std_long','std_alt','cs'],
+    'GPGRS': ['hhmmss.ss','mode'],
+    'GPRMC': ['hhmmss.ss','Status','Latitude','N','Longitude','E','Spd','Cog','date','mv','mvE','mode','cs'],
+    'GPTHS': ['headt','mi','cs'],
+    'GPTXT': ['xx','yy','zz','string','cs'],
+    'GPVTG': ['cogt','T','cogm','M','sog','N','kph','K','mode','cs'],
+    'GPZDA': ['hhmmss.ss','day','month','year','ltzh','ltzn','cs']
+    }
+
+# implement NMEA polling with GPQ
 class GpsNeo6():
     """
     Class for the Neo 6M GPS chip
@@ -38,12 +58,12 @@ class GpsNeo6():
         
         self.port=serial.Serial(port,b_rate)
         self.diff=diff
-        self.tabCode=["GPVTG","GPGGA","GPGSA","GPGSV","GPGLL","GPRMC"]
+        self.data={} # all NMEA data put out by the chip will be stored here
         self.velocity=""
         self.latitude=""
+        self.NS=""
         self.longitude=""
-        self.latitudeDeg=""
-        self.longitudeDeg=""
+        self.EW=""
         self.time=""
         self.altitude=""
         self.precision=""
@@ -66,53 +86,252 @@ class GpsNeo6():
         """
         
         if self.fix:
-            rep="time: "+str(self.time)+"\nlatitude: "+str(self.latitude) \
-                +"\nlongitude: "+str(self.longitude)+"\nvelocity: "+str(self.velocity)+" km/h" \
-                +"\naltitude: "+str(self.altitude)+" metre(s)"+"\ngeoid separation: "+str(self.altref)+" metre(s)"+"\nhorizontal precision: "+str(self.precision)+" meter(s)" \
+            rep="Time: "+str(self.time)+"\nlatitude: "+str(self.latitude)+" "+self.NS\
+                +"\nLongitude: "+str(self.longitude)+" "+self.EW\
+                +"\nVelocity: "+str(self.velocity)+" km/h" \
+                +"\nAltitude: "+str(self.altitude)+" metre(s)"\
+                +"\nGeoid separation: "+str(self.altref)+" metre(s)"\
+                +"\nHorizontal precision: "+str(self.precision)+" meter(s)" \
                 +"\nNumber of connected satellites: "+str(self.satellite)
             if self.geo:
-                rep+="\nlocation : "+self.geolocation()
+                rep+="\nLocation : "+self.geolocation()
             return rep
         else:
             rep='GPS not located, connected sattellites: ' + str(self.satellite)
             return rep
     
     
-    
-    def readSerial(self):
+    def read(self):
         """
-        read data from serial port
+        read gps data, parse and store in data variables
         """
         
-        l='->'
-        line=""
-        tab={}
-        gp=[]
-        # find starting point
-        while True:
-            line=self.port.readline().decode().strip()
-            if 'GPRMC' in line:
-                break
-        # read all data
+        self.data = self.readSerial()
+        if not "GPGGA" in self.data.keys():
+            print("Please activate GPGGA NMEA message output")
+            return
+        
+        gpgga = self.data["GPGGA"]
+        t = str(int(gpgga['hhmmss.ss'][0:2])+self.diff)+":"+gpgga['hhmmss.ss'][2:4]+":"\
+            +str(float(gpgga['hhmmss.ss'][4:8])) # convert time to local time zone       
+        self.time = t
+        self.fix = int(gpgga['FS'])
+        if self.fix != 0:
+            self.latitude = self.degToDec(gpgga['Latitude']) # latitude decimal
+            self.NS=gpgga['N'] # North/South Indicator
+            self.longitude = self.degToDec(gpgga['Longitude']) # longitude decimal
+            self.EW = gpgga['E'] # East/West Indicator
+            self.satellite = int(gpgga['NoSV']) # number of connected satellites
+            self.altitude = float(gpgga['msl']) # altitude
+            self.precision = float(gpgga['HDOP']) # horitontal precision
+            self.altref = float(gpgga['Altref']) # geoid separation
+            
+            if "GPVTG" in self.data.keys():
+                self.velocity = float(self.data["GPVTG"]['kph']) # get velocity
+            else:
+                self.velocity = ""
+                print('For velocity output, please activate GPVTG NMEA message output')
+        else:
+            print('No Satellite Fix')
+    
+
+    def readSerial(self):
+        first_header = ''
+        raw = {}
         while True:
             # split line to list
-            line=self.port.readline()
+            line = self.port.readline()
             line = line.decode().strip().split(',')
-            line[0]=line[0].strip('$')
-            #print(line)
-            # multiple GPSV lines joined in list other types separately
-            for i in self.tabCode:
-                if i=="GPGSV":
-                    gp.append(line[1:])
-                elif line[0] == i:
-                    tab[i]=line[1:]
-                else:
-                    pass
             
-            if line[0] == 'GPRMC':
-                tab["GPGSV"]=gp
+            #split checksum from last element
+            if '*' in line[-1]:
+                cksm = line[-1][line[-1].index('*'):]
+                line[-1] = line[-1][: line[-1].index('*')]
+                line.append(cksm)
+                
+            if not ('$' in line[0]):
+                continue
+            header = line[0].strip('$')
+            if not header in ['GPGSV', 'GPTXT'] and first_header == '':
+                first_header = header
+                raw[header] = line[1:]
+                continue
+            elif header == 'GPGSV' and first_header == '':
+                continue
+            
+            if header == first_header:
                 break
-        return tab
+            
+            if not header in ['GPGSV', 'GPTXT']:
+                raw[header] = line[1:]
+            else:
+                if header in raw.keys():
+                    raw[header].append(line[1:])
+                else:
+                    raw[header] = []
+                    raw[header].append(line[1:])
+        return self.parseNMEA(raw)
+
+    def parseNMEA(self, raw):
+        """
+        select appropriate method to decode NMEA message
+        """
+        
+        for message in raw:
+            if not message in ['GPGSV', 'GPGLL', 'GPGRS', 'GPGSA', 'GPTXT', 'PUBX']:
+                raw[message] = self.decodeNMEA(message, raw[message])
+                
+            elif message == 'GPTXT':
+                for i in range(len(raw[message])):
+                    raw[message][i] = self.decodeNMEA(message, raw[message][i])
+                    
+            elif message == 'GPGSV':
+                raw[message] = self.decodeGPGSV(raw[message])
+                    
+            elif message == 'GPGLL':
+                raw[message] = self.decodeGPGLL(raw[message])
+                    
+            elif message == 'GPGRS':
+                raw[message] = self.decodeGPGRS(raw[message])
+                    
+            elif message == 'GPGSA':
+                raw[message] = self.decodeGPGSA(raw[message])
+                    
+            elif message == 'PUBX':
+                raw[message] = self.decodePUBX(raw[message])
+                
+        return raw
+
+            
+    def decodeNMEA(self, header, message):
+        """
+        decode standard NMEA message of fixed length
+        """
+
+        if not (sys.version_info[0] >= 3 and sys.version_info[1] >= 6):
+            message_dic = OrderedDict()
+        else:
+            message_dic = {}
+            
+        for i in range(len(message)):
+            message_dic[NMEA_key[header][i]] = message[i]
+        return message_dic
+
+
+    def decodeGPGSV(self, message):
+        """
+        decode GPGSV NMEA messages
+        """
+        
+        message_out = []
+        for i in range(len(message)):
+            
+            if not (sys.version_info[0] >= 3 and sys.version_info[1] >= 6):
+                message_dic = OrderedDict()
+            else:
+                message_dic = {}
+
+            # GSV messages are read as list, parsing one by one            
+            message_i = message[i]
+
+            # first three parameters are fixed
+            beginning_msg = ['NoMsg','MsgNo','NoSv']
+            for j in range(len(beginning_msg)):
+                message_dic[beginning_msg[j]] = message_i[j]
+
+            # repeated block for individual satellites (max 4 reported in one message)
+            message_dic['satellites'] = []
+            repeat = message_i[3:-1]
+            
+            for j in range(int(len(repeat)/4)):
+                if not (sys.version_info[0] >= 3 and sys.version_info[1] >= 6):
+                    satellite = OrderedDict()
+                else:
+                    satellite = {}
+                    
+                repeat_sat = repeat[0+j*4:4+j*4]
+                satellite_ref = ['sv','elv','az','cno']
+                #decoding each satellites parameters
+                for k in range(len(satellite_ref)):
+                    satellite[satellite_ref[k]] = repeat_sat[k]
+                message_dic['satellites'].append(satellite)
+                
+            message_dic['cs'] = message_i[-1]
+            message_out.append(message_dic)
+
+        return message_out
+
+
+    def decodeGPGLL(self, message):
+        """
+        decode GPGLL NMEA messages
+        """
+        
+        if not (sys.version_info[0] >= 3 and sys.version_info[1] >= 6):
+            message_dic = OrderedDict()
+        else:
+            message_dic = {}
+            
+        # fixed block
+        beginning_msg = ['Latitude','N','Longitude','E','hhmmss.ss','valid']
+        for i in range(len(beginning_msg)):
+            message_dic[beginning_msg[i]] = message[i]
+
+        # optional parameter
+        if len(message) == 8:
+            message_dic['Mode'] = message[6]
+            message_dic['cs'] = message[7]
+        else:
+            message_dic['cs'] = message[6]
+
+        return message_dic
+
+
+    def decodeGPGRS(self, message):
+        """
+        decode GPGRS NMEA messages
+        """
+        
+        if not (sys.version_info[0] >= 3 and sys.version_info[1] >= 6):
+            message_dic = OrderedDict()
+        else:
+            message_dic = {}
+
+        message_dic['hhmmss.ss'] = message[0]
+        message_dic['mode'] = message[1]
+        message_dic['residual'] = message[2:14]
+        message_dic['cs'] = message[14]
+
+        return message_dic
+
+
+    def decodeGPGSA(self, message):
+        """
+        decode GPGSA NMEA messages
+        """
+        
+        if not (sys.version_info[0] >= 3 and sys.version_info[1] >= 6):
+            message_dic = OrderedDict()
+        else:
+            message_dic = {}
+
+        message_dic['Smode'] = message[0]
+        message_dic['FS'] = message[1]
+        message_dic['sv'] = message[2:14]
+        message_dic['PDOP'] = message[14]
+        message_dic['HDOP'] = message[15]
+        message_dic['VDOP'] = message[16]
+        message_dic['cs'] = message[17]
+
+        return message_dic
+
+
+    def decodePUBX(self, message):
+        """
+        decode PUBX NMEA messages (ublox custom)
+        """
+        pass
+    
     
     def degToDec(self,deg):
         """
@@ -123,28 +342,6 @@ class GpsNeo6():
         minutes=float(deg[deg.find(".")-2:])/100
         decimal_degrees = degrees+(minutes*(100/60))
         return decimal_degrees
-    
-    
-    def read(self):
-        """
-        transform raw gps data
-        """
-        
-        raw=self.readSerial()
-        data=raw["GPGGA"]
-        t=str(int(data[0][0:2])+self.diff)+":"+data[0][2:4]+":"+data[0][4:6] # convert time to local time zone       
-        self.time=t
-        self.fix = int(data[5])
-        if self.fix != 0:
-            self.latitude=self.degToDec(data[1]) # latitude decimal
-            self.longitude=self.degToDec(data[3]) # longitude decimal
-            self.satellite=int(data[6]) # number of connected satellites
-            self.altitude=float(data[8]) # altitude
-            self.precision=float(data[7]) # horitontal precision
-            self.altref=float(data[10]) # geoid separation
-            self.velocity=float(raw["GPVTG"][6]) # get velocity
-        else:
-            print('No Satellite Fix')
         
     
     def geolocation(self):
