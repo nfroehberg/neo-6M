@@ -28,12 +28,13 @@ https://github.com/geopy/geopy
 
 # results
 
-                time: 10:45:04
-                latitude: 54.30782966666666
-                longitude: 9.534877
-                velocity: 0.031 km/h
-                altitude: 28.1 metre(s)
-                geoid separation: 44.6 metre(s)
-                horizontal precision: 0.95 meter(s)
-                Number of connected satellites: 9
+        Time: 18:57:56.0
+        latitude: 54.3078435 N
+        Longitude: 9.534970833333333 E
+        Velocity: 0.108 km/h
+        Altitude: -2.0 metre(s)
+        Geoid separation: 44.6 metre(s)
+        Horizontal precision: 0.95 meter(s)
+        Number of connected satellites: 10
+
 
