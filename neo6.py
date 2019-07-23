@@ -1,7 +1,20 @@
 #/usr/bin/python3
 #-*- coding: utf-8 -*-
 
+# Using the Ublox Neo-6M GPS module
+# Reading GPS data from NMEA sequences
+# changing configuration of the chip with UBX commands
+# Nico Fröhberg 2019
+# script for reading GPS data based on: https://github.com/linuxnico/neo-6M
+
+import binascii
 import serial
+
+try:
+    from ublox_neo6m_ubx import Neo6M_UBX
+except:
+    print("ublox_neo6m_ubx driver not found. You can still get location data from the chip but not change its configuration")
+
 try:
     from geopy.geocoders import Nominatim
     geo=True
@@ -11,21 +24,22 @@ except:
 
 class GpsNeo6():
     """
-        class de gestion du soc NEO 6M
-        """
+    Class for the Neo 6M GPS chip
+    """
 
     
-    def __init__(self,port,debit=9600,diff=1):
+    def __init__(self, port, b_rate=9600, diff=2, geoloc=geo):
         """
-            on initialise les variables a partir de:
-            port: port com
-            debit: vitesse en bauds
-            diff: differece heure local et utc
-            """
-        self.port=serial.Serial(port,debit)
+        initialize variables:
+        port: serial port
+        b_rate: baud rate
+        diff: time difference of local time to UTC in hours
+        """
+        
+        self.port=serial.Serial(port,b_rate)
         self.diff=diff
-        self.tabCode=["GPVTG","GPGGA","GPGSA","GPGLL","GPRMC","GPGSV"]
-        self.vitesse=""
+        self.tabCode=["GPVTG","GPGGA","GPGSA","GPGSV","GPGLL","GPRMC"]
+        self.velocity=""
         self.latitude=""
         self.longitude=""
         self.latitudeDeg=""
@@ -34,114 +48,136 @@ class GpsNeo6():
         self.altitude=""
         self.precision=""
         self.satellite=""
+        self.altref=""
         self.geoloc=Nominatim()
+        self.fix=0
+        self.ubx=Neo6M_UBX(port,b_rate)
+        self.geo=geoloc
         
     def __del__(self):
         """
-            on ferme le port a la destruction de l'objet
-            """
+        close serial port on destruction of object
+        """
         self.port.close()
         
     def __repr__(self):
         """
-            on affiche les info
-            """
-        rep="heure: "+str(self.time)+"\rlatitude: "+str(self.latitude) \
-            +"\rlongitude: "+str(self.longitude)+"\rvitesse: "+str(self.vitesse)+" km/h" \
-            +"\raltitude: "+str(self.altitude)+" metre(s)"+"\rprecision: "+str(self.precision)+" metre(s)" \
-            +"\rNombre de satelites vue: "+str(self.satellite)
-        if geo:
-            rep+="\rlieu : "+self.geolocation()
-        return rep
-    
-    
-    
-    def recupData(self):
+        display data
         """
-            on recupere les datas sur le port serie
-            """
+        
+        if self.fix:
+            rep="time: "+str(self.time)+"\nlatitude: "+str(self.latitude) \
+                +"\nlongitude: "+str(self.longitude)+"\nvelocity: "+str(self.velocity)+" km/h" \
+                +"\naltitude: "+str(self.altitude)+" metre(s)"+"\ngeoid separation: "+str(self.altref)+" metre(s)"+"\nhorizontal precision: "+str(self.precision)+" meter(s)" \
+                +"\nNumber of connected satellites: "+str(self.satellite)
+            if self.geo:
+                rep+="\nlocation : "+self.geolocation()
+            return rep
+        else:
+            rep='GPS not located, connected sattellites: ' + str(self.satellite)
+            return rep
+    
+    
+    
+    def readSerial(self):
+        """
+        read data from serial port
+        """
+        
         l='->'
-        ligne=""
+        line=""
         tab={}
         gp=[]
-        while len(tab)<6:
-            l=self.port.read(2)
-            if b'\r' in l or b'\n' in l:
-                l=''
-                for i in self.tabCode:
-                    if i in ligne:
-                        if i=="GPGSV": 
-                            gp.append(ligne)
-                            tab["GPGSV"]=gp
-                        else:                     
-                            tab[i]=ligne
-                            gp=[]
-                ligne=""
-            else: 
-                try:
-                    ligne+=str(l.decode().strip())
-                except: pass
+        # find starting point
+        while True:
+            line=self.port.readline().decode().strip()
+            if 'GPRMC' in line:
+                break
+        # read all data
+        while True:
+            # split line to list
+            line=self.port.readline()
+            line = line.decode().strip().split(',')
+            line[0]=line[0].strip('$')
+            #print(line)
+            # multiple GPSV lines joined in list other types separately
+            for i in self.tabCode:
+                if i=="GPGSV":
+                    gp.append(line[1:])
+                elif line[0] == i:
+                    tab[i]=line[1:]
+                else:
+                    pass
+            
+            if line[0] == 'GPRMC':
+                tab["GPGSV"]=gp
+                break
         return tab
     
     def degToDec(self,deg):
         """
-            fonction de tronsformation des coordonees en degre vers les degre decimals
-            """
-        dec=int(deg[0:deg.find(".")-2])
-        min=int(deg[deg.find(".")-2:deg.find(".")])/60
-        sec=float("0."+deg[deg.find(".")+1:])/36
-        return round(dec+min+sec,10)
+        transform degrees to decimal
+        """
+        
+        degrees=int(deg[0:deg.find(".")-2])
+        minutes=float(deg[deg.find(".")-2:])/100
+        decimal_degrees = degrees+(minutes*(100/60))
+        return decimal_degrees
     
     
-    def traite(self):
+    def read(self):
         """
-            on traite les donnes pour les mettres en formes
-            """
-        donnees=self.recupData()
-        data=donnees["GPGGA"]
-        data=data.split(',')
-        temps=str(int(data[1][0:2])+self.diff)+"h"+data[1][2:4]+"m"+data[1][4:6]+"s" #mets en forme la date avec le decalage de l'heure        
-        self.time=temps
-        self.latitude=self.degToDec(data[2]) #mets au format decimale xx.yyyyyy
-        self.latitudeDeg=float(data[2])/100#+data[3]
-        self.longitude=self.degToDec(data[4]) #mets au format decimale xx.yyyyyy
-        self.longitudeDeg=float(data[4])/100#+data[5]
-        self.altitude=data[9]
-        self.precision=data[6]
-        self.vitesse=self.traiteGPVTG(donnees["GPVTG"]) #recupere que la vitesse de deplacement
-        self.satellite=int(donnees["GPGSV"][0].split(',')[3]) #recupere le nombre de satellite vue
-        
-        
-        
-    def traiteGPVTG(self,data):
+        transform raw gps data
         """
-            on traite les donnees pour la vitesse
-            """
-        data=data.split(',')
-        return data[7]
+        
+        raw=self.readSerial()
+        data=raw["GPGGA"]
+        t=str(int(data[0][0:2])+self.diff)+":"+data[0][2:4]+":"+data[0][4:6] # convert time to local time zone       
+        self.time=t
+        self.fix = int(data[5])
+        if self.fix != 0:
+            self.latitude=self.degToDec(data[1]) # latitude decimal
+            self.longitude=self.degToDec(data[3]) # longitude decimal
+            self.satellite=int(data[6]) # number of connected satellites
+            self.altitude=float(data[8]) # altitude
+            self.precision=float(data[7]) # horitontal precision
+            self.altref=float(data[10]) # geoid separation
+            self.velocity=float(raw["GPVTG"][6]) # get velocity
+        else:
+            print('No Satellite Fix')
+        
     
     def geolocation(self):
         """
-            si on peut on geolocalise les coordonnees
-            """
+        get geolocation from coordinates
+        """
+        
         if geo:
-            try:
-                
+            try:                
                 location = self.geoloc.reverse(str(self.latitude)+", "+str(self.longitude))
                 return str(location)
-            except: return "Le Néant"
-        else: return "le Néant"
+            except:
+                return "Address for coordinates not found"
+        else:
+            return "Geopy is not installed, cannot get address for coordinates."
+
+    def sleep(self, seconds=0):
+        """
+        deactivate the chip for specified time (set to zero for indefinite time)
+        baseline current in deactivated state is ~15 mA @3.3V
+        """
         
+        duration = int(seconds*1000)
+        command = self.ubx.encode_ubx('RXM', 'PMREQ', 8, {'duration':duration, 'flags':self.ubx.ubx_flags('00000000000000000000000000000010')})
+        self.ubx.send_ubx(command)
     
     
 if __name__=="__main__":
-    #on definit le port la vitesse et la diferrence d'heure utc et locale
-    gps=GpsNeo6(port="com5",debit=9600,diff=2)
-    
-    while True:
-        #on appel un traitement gps
-        gps.traite()
-        #on affiche les infos
-        print(gps)
-        #print(gps.time)
-        
+    # define the serial port, baud rate and time difference of local time zone to UTC
+    # if geoloc = True and geopy.geocoders is installed on the system,
+    # address information is looked up for the specified coordinates
+    gps=GpsNeo6(port="/dev/ttyS0",b_rate=9600,diff=2, geoloc=True)
+    # read gps data
+    gps.read()
+    # print info
+    print(gps)       
